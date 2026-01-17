@@ -133,7 +133,7 @@ export default function ResultsPage({ params }: { params: { id: string } }) {
     }
   }, [job]);
 
-  // Probe download signed URL only if we expect CSV
+  // Probe download signed URL until CSV exists (review rows can appear before export finishes)
   useEffect(() => {
     if (!job) return;
     if (job.status === "failed") return;
@@ -146,9 +146,6 @@ export default function ResultsPage({ params }: { params: { id: string } }) {
       }
       return;
     }
-
-    // If review rows ready, don't spam download probes forever
-    if (reviewReady) return;
 
     const okToProbe = (job.progress ?? 0) >= 45 || job.status === "completed";
     if (!okToProbe) return;
@@ -191,23 +188,9 @@ export default function ResultsPage({ params }: { params: { id: string } }) {
   // ✅ IMPORTANT: canReview means "review rows exist OR csv exists"
   const canReview = canDownload || reviewReady;
 
-  const uiStatus: Job["status"] =
-    job?.status === "failed"
-      ? "failed"
-      : job?.status === "completed"
-      ? "completed"
-      : canReview
-      ? "completed"
-      : job?.status || "running";
+  const uiStatus: Job["status"] = job?.status || "running";
 
-  const uiProgress =
-    job?.status === "failed"
-      ? job?.progress || 0
-      : job?.status === "completed"
-      ? 100
-      : canReview
-      ? 100
-      : job?.progress || 0;
+  const uiProgress = job?.progress || 0;
 
   const mappingView = useMemo(() => {
     const m = job?.debug?.header_mapping;

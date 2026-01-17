@@ -102,15 +102,17 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
     (aiMinutesAgo !== null ? aiMinutesAgo >= 10 : createdMinutesAgo !== null && createdMinutesAgo >= 12);
 
   // 6) Derived status rules (IMPORTANT FIX)
-  // "completed" means: CSV exists OR job explicitly marked completed.
-  // If review rows exist but no CSV, keep status as running (or queued) so UI doesn't lie.
+  // "completed" means: CSV exists (never mark completed if CSV is missing).
+  // If review rows exist but no CSV, keep status as running/queued so UI doesn't lie.
   const derivedStatus =
     job.status === "failed"
       ? "failed"
-      : hasCsvOutput || job.status === "completed"
+      : hasCsvOutput
       ? "completed"
       : staleAi
       ? "failed"
+      : job.status === "completed"
+      ? "running"
       : job.status;
 
   const derivedProgress =
