@@ -14,6 +14,7 @@ type JobStatus = "queued" | "running" | "completed" | "failed";
 
 const LIFECYCLE_STRICT_MODE = String(process.env.LIFECYCLE_STRICT_MODE || "true").toLowerCase() === "true";
 const MAX_ROWS = Math.min(500, Math.max(1, Number(process.env.MAX_ROWS || "200")));
+const ROW_TIMEOUT_MS = Math.min(120000, Math.max(15000, Number(process.env.ROW_TIMEOUT_MS || "45000")));
 
 function safeErrMessage(err: any) {
   return (
@@ -22,6 +23,20 @@ function safeErrMessage(err: any) {
     err?.error?.message ||
     (typeof err === "string" ? err : "Unknown error")
   );
+}
+
+async function withTimeout<T>(label: string, ms: number, fn: () => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), ms);
+  try {
+    const p = fn();
+    const timeoutPromise = new Promise<T>((_, rej) =>
+      controller.signal.addEventListener("abort", () => rej(new Error(`${label} timed out after ${ms}ms`)), { once: true })
+    );
+    return await Promise.race([p, timeoutPromise]);
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 type SbResult<T> = PromiseLike<{ data: T; error: any }>;
@@ -322,89 +337,98 @@ export const processUpload = inngest.createFunction(
               enrichment_json: {},
             };
 
-            // AI normalize
             try {
-              const ai = await normalizeTechRowAI(
-                {
-                  technology: row.canonical?.technology,
-                  vendor: row.canonical?.vendor || null,
-                  version: row.canonical?.version || null,
-                  end_of_support: row.canonical?.end_of_support || null,
-                  end_of_life: row.canonical?.end_of_life || null,
-                },
-                {}
-              );
+              await withTimeout(`row-${rowIndexForDb}`, ROW_TIMEOUT_MS, async () => {
+                // AI normalize
+                try {
+                  const ai = await normalizeTechRowAI(
+                    {
+                      technology: row.canonical?.technology,
+                      vendor: row.canonical?.vendor || null,
+                      version: row.canonical?.version || null,
+                      end_of_support: row.canonical?.end_of_support || null,
+                      end_of_life: row.canonical?.end_of_life || null,
+                    },
+                    {}
+                  );
 
-              base.canonical_name = (ai.canonical_name || base.canonical_name).trim();
-              base.canonical_vendor = (ai.canonical_vendor || base.canonical_vendor || "").trim();
-              base.normalized_version = (ai.normalized_version || base.normalized_version || "").trim();
+                  base.canonical_name = (ai.canonical_name || base.canonical_name).trim();
+                  base.canonical_vendor = (ai.canonical_vendor || base.canonical_vendor || "").trim();
+                  base.normalized_version = (ai.normalized_version || base.normalized_version || "").trim();
 
-              base.normalized_end_of_support = (ai.normalized_end_of_support || base.normalized_end_of_support || "").trim();
-              base.normalized_end_of_life = (ai.normalized_end_of_life || base.normalized_end_of_life || "").trim();
+                  base.normalized_end_of_support =
+                    (ai.normalized_end_of_support || base.normalized_end_of_support || "").trim();
+                  base.normalized_end_of_life =
+                    (ai.normalized_end_of_life || base.normalized_end_of_life || "").trim();
 
-              base.domain = (ai.domain || "").trim();
+                  base.domain = (ai.domain || "").trim();
 
-              const rawConf = Number(ai.confidence ?? 0.6);
-              base.confidence = Math.min(1, Math.max(0, rawConf)).toFixed(2);
-              base.ai_notes = ai.notes || base.ai_notes || "";
+                  const rawConf = Number(ai.confidence ?? 0.6);
+                  base.confidence = Math.min(1, Math.max(0, rawConf)).toFixed(2);
+                  base.ai_notes = ai.notes || base.ai_notes || "";
+                } catch (e: any) {
+                  const m = safeErrMessage(e);
+                  base.ai_notes = `AI failed: ${m}`;
+                  base.validation_notes = `${base.validation_notes} AI failed: ${m}`.trim();
+                }
+
+                // Vendor site
+                try {
+                  const sig = await validateVendorWebsite({
+                    vendor_input: row.canonical?.vendor,
+                    vendor_canonical: base.canonical_vendor,
+                    timeout_ms: 4000,
+                  });
+
+                  base.vendor_site_url = sig.vendor_site_url || "";
+                  base.vendor_site_verified = sig.vendor_site_verified ? "TRUE" : "FALSE";
+
+                  if (sig.vendor_signal_notes) {
+                    base.validation_notes = `${base.validation_notes} Vendor signal: ${sig.vendor_signal_notes}`.trim();
+                  }
+
+                  const boosted = Math.min(1, Number(base.confidence) + (sig.confidence_boost || 0));
+                  base.confidence = boosted.toFixed(2);
+                } catch (e: any) {
+                  base.validation_notes = `${base.validation_notes} Vendor site check failed: ${safeErrMessage(e)}`.trim();
+                }
+
+                // Parse service pack early
+                if (base.normalized_version) {
+                  const partsEarly = parseVersionParts(base.normalized_version);
+                  base.service_pack = partsEarly.service_pack;
+                }
+
+                // Enrichment
+                try {
+                  const { patched, enrichment } = await enrichNormalizedRow({
+                    canonical_name: base.canonical_name,
+                    canonical_vendor: base.canonical_vendor,
+                    normalized_version: base.normalized_version,
+                    service_pack: base.service_pack,
+                    input_eos: base.input_eos,
+                    input_eol: base.input_eol,
+                    domain: base.domain,
+                    vendor_site_url: base.vendor_site_url,
+                  });
+
+                  Object.assign(base, patched);
+
+                  base.vuln_total = enrichment.vuln_total;
+                  base.vuln_top = enrichment.vuln_top;
+                  base.vuln_sources = enrichment.vuln_sources;
+                  base.kev_flagged = enrichment.kev_flagged;
+
+                  base.lifecycle_evidence_url = (enrichment as any).lifecycle_evidence_url || "";
+                  base.lifecycle_evidence_title = (enrichment as any).lifecycle_evidence_title || "";
+                  base.lifecycle_retrieved_at = (enrichment as any).lifecycle_retrieved_at || "";
+                } catch (e: any) {
+                  base.lifecycle_notes = `${base.lifecycle_notes} Enrichment failed: ${safeErrMessage(e)}`.trim();
+                }
+              });
             } catch (e: any) {
               const m = safeErrMessage(e);
-              base.ai_notes = `AI failed: ${m}`;
-              base.validation_notes = `${base.validation_notes} AI failed: ${m}`.trim();
-            }
-
-            // Vendor site
-            try {
-              const sig = await validateVendorWebsite({
-                vendor_input: row.canonical?.vendor,
-                vendor_canonical: base.canonical_vendor,
-                timeout_ms: 4000,
-              });
-
-              base.vendor_site_url = sig.vendor_site_url || "";
-              base.vendor_site_verified = sig.vendor_site_verified ? "TRUE" : "FALSE";
-
-              if (sig.vendor_signal_notes) {
-                base.validation_notes = `${base.validation_notes} Vendor signal: ${sig.vendor_signal_notes}`.trim();
-              }
-
-              const boosted = Math.min(1, Number(base.confidence) + (sig.confidence_boost || 0));
-              base.confidence = boosted.toFixed(2);
-            } catch (e: any) {
-              base.validation_notes = `${base.validation_notes} Vendor site check failed: ${safeErrMessage(e)}`.trim();
-            }
-
-            // Parse service pack early
-            if (base.normalized_version) {
-              const partsEarly = parseVersionParts(base.normalized_version);
-              base.service_pack = partsEarly.service_pack;
-            }
-
-            // Enrichment
-            try {
-              const { patched, enrichment } = await enrichNormalizedRow({
-                canonical_name: base.canonical_name,
-                canonical_vendor: base.canonical_vendor,
-                normalized_version: base.normalized_version,
-                service_pack: base.service_pack,
-                input_eos: base.input_eos,
-                input_eol: base.input_eol,
-                domain: base.domain,
-                vendor_site_url: base.vendor_site_url,
-              });
-
-              Object.assign(base, patched);
-
-              base.vuln_total = enrichment.vuln_total;
-              base.vuln_top = enrichment.vuln_top;
-              base.vuln_sources = enrichment.vuln_sources;
-              base.kev_flagged = enrichment.kev_flagged;
-
-              base.lifecycle_evidence_url = (enrichment as any).lifecycle_evidence_url || "";
-              base.lifecycle_evidence_title = (enrichment as any).lifecycle_evidence_title || "";
-              base.lifecycle_retrieved_at = (enrichment as any).lifecycle_retrieved_at || "";
-            } catch (e: any) {
-              base.lifecycle_notes = `${base.lifecycle_notes} Enrichment failed: ${safeErrMessage(e)}`.trim();
+              base.validation_notes = `${base.validation_notes} Row processing timeout: ${m}`.trim();
             }
 
             // Version parts
